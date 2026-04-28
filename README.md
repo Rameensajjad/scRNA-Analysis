@@ -2,6 +2,8 @@
 
 > A complete end-to-end scRNA-seq workflow combining **STARsolo on Galaxy** for raw data
 > preprocessing and **Scanpy (Python)** for downstream clustering and annotation of human PBMC data.
+> The pipeline is built on the **AnnData** data structure — the universal container for single-cell
+> data in Python.
 
 ---
 
@@ -9,6 +11,7 @@
 
 - [Overview](#overview)
 - [Repository Structure](#repository-structure)
+- [AnnData — The Data Container](#anndata--the-data-container)
 - [Part 1 — Raw Preprocessing (Galaxy)](#part-1--raw-preprocessing-galaxy)
 - [Part 2 — Downstream Analysis (Python)](#part-2--downstream-analysis-python)
 - [Key Findings](#key-findings)
@@ -49,6 +52,106 @@ Preprocessing-of-scRNA/
 │
 └── galaxy_figures/              ← QC and alignment plots from Galaxy
 ```
+
+---
+
+## AnnData — The Data Container
+
+Every step of the downstream analysis operates on an **AnnData** (`adata`) object — the standard
+data structure in the scverse ecosystem (Scanpy, decoupler, CellTypist, MuData, etc.).
+Understanding its layout helps in reading the code and interpreting outputs.
+
+### What is AnnData?
+
+AnnData stores a cells × genes matrix together with all associated metadata in a single,
+self-consistent object. Printing `adata` gives a concise summary:
+
+```python
+import anndata
+adata = anndata.read_h5ad("scrna_results.h5ad")
+print(adata)
+# AnnData object with n_obs × n_vars = 8785 × 36601
+#     obs:  'sample', 'n_genes_by_counts', 'pct_counts_mt', 'leiden_res0_5', ...
+#     var:  'mt', 'ribo', 'hb', 'highly_variable', ...
+#     uns:  'leiden', 'pca', 'umap', ...
+#     obsm: 'X_pca', 'X_umap'
+#     layers: 'counts'
+#     obsp: 'connectivities', 'distances'
+```
+
+### Slot Reference
+
+| Slot | What it holds | Used for |
+|---|---|---|
+| `adata.X` | Active data matrix (cells × genes) — log-normalised counts | Clustering, plotting, DE |
+| `adata.obs` | Cell-level annotations (one row per cell) | QC flags, cluster labels, doublet scores |
+| `adata.var` | Gene-level annotations (one row per gene) | HVG flags, mt/ribo/hb markers |
+| `adata.obs_names` | Unique cell index (sequencing barcodes) | Cell identity across all slots |
+| `adata.var_names` | Unique gene index (gene symbols) | Gene identity across all slots |
+| `adata.layers["counts"]` | Raw integer counts (preserved before normalisation) | DE tests, re-normalisation |
+| `adata.obsm["X_pca"]` | PCA coordinates — shape (n_cells, 50) | Neighbour graph construction |
+| `adata.obsm["X_umap"]` | UMAP coordinates — shape (n_cells, 2) | 2-D visualisation |
+| `adata.obsp["connectivities"]` | Sparse kNN connectivity graph | Leiden clustering |
+| `adata.uns` | Unstructured metadata — algorithm params, colour palettes | Record-keeping |
+
+### How the Pipeline Uses AnnData
+
+```
+Raw counts (.h5)
+      │
+      ▼
+adata.X  ←── loaded via sc.read_10x_h5()
+      │
+      ├── QC metrics → adata.obs  (n_genes_by_counts, pct_counts_mt, ...)
+      ├── Raw counts saved → adata.layers["counts"]
+      ├── Normalise + log1p → adata.X updated in-place
+      ├── HVG selection → adata.var["highly_variable"]
+      ├── PCA → adata.obsm["X_pca"]
+      ├── kNN graph → adata.obsp["connectivities"]
+      ├── UMAP → adata.obsm["X_umap"]
+      ├── Leiden clusters → adata.obs["leiden_res0_5"]
+      └── Cell-type labels → adata.obs["majority_voting"]  /  adata.obs["dc_anno"]
+```
+
+### Key Operations
+
+**Loading data**
+```python
+import anndata as ad
+import scanpy as sc
+
+# From 10x h5 format
+adata = sc.read_10x_h5("filtered_feature_bc_matrix.h5")
+
+# From saved h5ad
+adata = ad.read_h5ad("scrna_results.h5ad")
+```
+
+**Inspecting the object**
+```python
+adata.shape          # (n_cells, n_genes)
+adata.obs.head()     # cell metadata table
+adata.var.head()     # gene metadata table
+adata.obs_names[:5]  # first 5 cell barcodes
+adata.var_names[:5]  # first 5 gene names
+```
+
+**Subsetting**
+```python
+# Keep only high-quality cells
+adata = adata[~adata.obs["predicted_doublet"].to_numpy()].copy()
+
+# Keep only highly variable genes (for PCA)
+adata_hvg = adata[:, adata.var["highly_variable"]]
+```
+
+**Saving and loading**
+```python
+adata.write_h5ad("scrna_results.h5ad")   # save
+adata = ad.read_h5ad("scrna_results.h5ad")  # load
+```
+
+> **Reference:** [AnnData Getting Started Tutorial](https://scverse-tutorials.readthedocs.io/en/latest/notebooks/anndata_getting_started.html)
 
 ---
 
@@ -129,9 +232,9 @@ The filtered matrix from this step feeds directly into Part 2.
 
 ### What This Step Does
 
-The clean gene expression matrix is loaded into Python and taken through normalization,
-dimensionality reduction, clustering, and cell type annotation using the **Scanpy** ecosystem.
-Two samples (`s1d1` and `s1d3`) from the NeurIPS 2021 dataset are analyzed together.
+The clean gene expression matrix is loaded into an **AnnData object** in Python and taken through
+normalization, dimensionality reduction, clustering, and cell type annotation using the **Scanpy**
+ecosystem. Two samples (`s1d1` and `s1d3`) from the NeurIPS 2021 dataset are analyzed together.
 
 ---
 
@@ -143,7 +246,26 @@ Two samples (`s1d1` and `s1d3`) from the NeurIPS 2021 dataset are analyzed toget
 
 ---
 
-### Step 1 — Quality Control
+### Step 1 — Load Data into AnnData
+
+```python
+import anndata as ad
+import scanpy as sc
+
+# Download and concatenate two samples
+adatas = {sid: sc.read_10x_h5(path) for sid, path in sample_paths.items()}
+adata = ad.concat(adatas, label="sample")
+adata.obs_names_make_unique()
+
+print(adata)  # AnnData object with n_obs × n_vars = 17125 × 36601
+```
+
+All downstream results — QC metrics, cluster labels, embeddings — will accumulate in this
+single `adata` object via its `obs`, `obsm`, and `obsp` slots.
+
+---
+
+### Step 2 — Quality Control
 
 Three biologically meaningful gene categories are flagged and used to assess cell quality:
 
@@ -151,6 +273,9 @@ Three biologically meaningful gene categories are flagged and used to assess cel
 adata.var["mt"]   = adata.var_names.str.startswith("MT-")           # mitochondrial
 adata.var["ribo"] = adata.var_names.str.startswith(("RPS", "RPL"))  # ribosomal
 adata.var["hb"]   = adata.var_names.str.contains(r"^HB[^EP]", regex=True)  # hemoglobin
+
+sc.pp.calculate_qc_metrics(adata, qc_vars=["mt", "ribo", "hb"], inplace=True, log1p=True)
+# Results land in adata.obs: n_genes_by_counts, total_counts, pct_counts_mt, ...
 
 sc.pp.filter_cells(adata, min_genes=100)
 sc.pp.filter_genes(adata, min_cells=3)
@@ -161,13 +286,14 @@ are removed. Violin and scatter plots visualize distributions before filtering.
 
 ---
 
-### Step 2 — Doublet Detection
+### Step 3 — Doublet Detection
 
 Doublets are droplets that accidentally captured two cells and appear as artificially
 high-count cells. Scrublet scores each cell per batch:
 
 ```python
-sc.pp.scrublet(adata, batch_key="sample")
+sc.external.pp.scrublet(adata, batch_key="sample")
+# Adds adata.obs["doublet_score"] and adata.obs["predicted_doublet"]
 adata = adata[~adata.obs["predicted_doublet"].to_numpy().astype(bool)].copy()
 ```
 
@@ -175,52 +301,62 @@ Predicted doublets are confirmed on UMAP before removal.
 
 ---
 
-### Step 3 — Normalization
+### Step 4 — Normalization
 
-Raw counts are preserved, then the data is normalized and log-transformed:
+Raw counts are preserved in `adata.layers["counts"]`, then the data is normalized and
+log-transformed into `adata.X`:
 
 ```python
-adata.layers["counts"] = adata.X.copy()  # save raw counts
-sc.pp.normalize_total(adata)              # normalize to median library size
-sc.pp.log1p(adata)                        # log1p transform
+adata.layers["counts"] = adata.X.copy()  # preserve raw counts in a layer
+sc.pp.normalize_total(adata)              # normalize to median library size → adata.X
+sc.pp.log1p(adata)                        # log1p transform → adata.X
 ```
 
 This ensures comparability across cells with different sequencing depths.
 
 ---
 
-### Step 4 — Feature Selection and Dimensionality Reduction
+### Step 5 — Feature Selection and Dimensionality Reduction
 
-2,000 highly variable genes (HVGs) are selected in a batch-aware manner, then PCA
-reduces the data to 50 components before UMAP embedding:
+2,000 highly variable genes (HVGs) are selected in a batch-aware manner. The HVG flag is
+stored in `adata.var["highly_variable"]`. PCA reduces the data to 50 components
+(`adata.obsm["X_pca"]`) before UMAP embedding (`adata.obsm["X_umap"]`):
 
 ```python
 sc.pp.highly_variable_genes(adata, n_top_genes=2000, batch_key="sample")
+# → adata.var["highly_variable"] = True/False
+
 sc.tl.pca(adata)
+# → adata.obsm["X_pca"]  shape: (n_cells, 50)
+
 sc.pp.neighbors(adata)
+# → adata.obsp["connectivities"], adata.obsp["distances"]
+
 sc.tl.umap(adata)
+# → adata.obsm["X_umap"]  shape: (n_cells, 2)
 ```
 
 The PCA variance ratio plot guides the choice of how many components to use.
 
 ---
 
-### Step 5 — Leiden Clustering
+### Step 6 — Leiden Clustering
 
-Graph-based Leiden clustering is applied at three resolutions to explore granularity:
+Graph-based Leiden clustering is applied at three resolutions to explore granularity.
+Results are stored as new columns in `adata.obs`:
 
 ```python
-# flavor="igraph" is required in scanpy >= 1.10
 sc.tl.leiden(adata, key_added="leiden_res0_02", resolution=0.02, flavor="igraph", n_iterations=2)
 sc.tl.leiden(adata, key_added="leiden_res0_5",  resolution=0.5,  flavor="igraph", n_iterations=2)
 sc.tl.leiden(adata, key_added="leiden_res2",    resolution=2,    flavor="igraph", n_iterations=2)
+# → adata.obs["leiden_res0_02"], adata.obs["leiden_res0_5"], adata.obs["leiden_res2"]
 ```
 
 Low resolution (0.02) gives broad populations; high resolution (2.0) reveals fine substructure.
 
 ---
 
-### Step 6 — Cell Type Annotation
+### Step 7 — Cell Type Annotation
 
 Two complementary strategies are used and compared side-by-side:
 
@@ -231,6 +367,7 @@ predictions = ct.annotate(adata, model="Immune_All_Low.pkl",
                           majority_voting=True,
                           over_clustering="leiden_res0_5")
 adata = predictions.to_adata()
+# → adata.obs["majority_voting"]  (CellTypist labels)
 ```
 
 **B) Marker gene scoring** — manual scoring using known immune cell markers:
@@ -239,6 +376,7 @@ adata = predictions.to_adata()
 for cell_type, genes in marker_dict.items():
     valid_genes = [g for g in genes if g in adata.var_names]
     sc.tl.score_genes(adata, gene_list=valid_genes, score_name=f"score_{cell_type}")
+# → adata.obs["score_CD14+ Mono"], adata.obs["score_NK"], etc.
 ```
 
 > **Note:** `decoupler 2.1.6` removed `run_mlm` / `run_ulm`. `sc.tl.score_genes` was used
@@ -249,13 +387,14 @@ and the two annotation results are overlaid on UMAP for comparison.
 
 ---
 
-### Step 7 — Differential Expression
+### Step 8 — Differential Expression
 
 Wilcoxon rank-sum test identifies cluster-specific marker genes:
 
 ```python
 sc.tl.rank_genes_groups(adata, groupby="leiden_res0_5", method="wilcoxon")
 sc.tl.filter_rank_genes_groups(adata, min_fold_change=1.5)
+# Results stored in adata.uns["rank_genes_groups"]
 ```
 
 Top 5 DEGs per cluster are visualized in a dotplot. Specific monocyte marker genes
@@ -337,3 +476,6 @@ of the clustering at resolution 0.5.
 
 7. Andrews S. (2010). FastQC: A Quality Control Tool for High Throughput Sequence Data.
    https://www.bioinformatics.babraham.ac.uk/projects/fastqc/
+
+8. Virshup I. et al. (2021). anndata: Annotated data. *bioRxiv*.
+   https://scverse-tutorials.readthedocs.io/en/latest/notebooks/anndata_getting_started.html
